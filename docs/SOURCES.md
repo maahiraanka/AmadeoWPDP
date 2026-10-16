@@ -12,3 +12,9 @@
 
 Web URLs for 2–7 could not be fetched from the sandbox. The PDFs are the copies used.
 Rule definitions go into `docs/PROFILES.md` only after they are checked against these sources.
+
+## Additional source
+
+| # | Topic | Source | Status |
+|---|---|---|---|
+| 8 | ICT Weekly Profiles — 12 Patterns (third-party text guide, attributed to Michael Huddleston) | PDF: ICT_Weekly_Profiles___12_Patterns | Read (text rules for all 12; see `PROFILES_12.md`) |

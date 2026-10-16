@@ -63,3 +63,7 @@ Targets (Text, source 8): two take-profit levels at **20%** and **30%** of the w
 | Consolidation Reversal | Diagrams | No |
 | Intraweek Reversal | Diagrams | No |
 | Thursday Counter | Diagrams | No |
+
+## Additional source: 12-pattern guide
+
+The 12-profile text guide (source 8) is in `docs/PROFILES_12.md`. It has written rules for all 12 profiles, but its premium/discount arrays and bias are not defined in code yet.
