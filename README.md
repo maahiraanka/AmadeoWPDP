@@ -18,6 +18,7 @@ ICT Weekly Profile research and indicator.
 - NQ and MNQ 1-minute data (2019–2026) fetched; raw files git-ignored.
 - Weekly high/low timing measured with a shuffled-return null model: no edge survives correction (see `docs/RESULTS.md`).
 - 12-pattern and TTrades profile rules recorded as text (`docs/PROFILES*.md`); not yet testable without premium/discount and sweep rules.
+- Profile-rule tests vs shuffled null (NQ): none pass (`docs/PROFILE_TESTS.md`).
 - No indicator yet.
 
 ## Commands
