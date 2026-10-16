@@ -24,7 +24,7 @@ Edges in percentage points. Full table incl. premium and discount: `reports/nq_n
 |---|---|---|---|---|
 | Discount | 145 | Tue weekly high | +6.0 pts | +2.1 |
 | Premium | 230 | Mon weekly high | −6.4 pts | −2.3 |
-| Discount | 145 | Mon weekly low | +3.3 pts | — (below |z| 2 threshold) |
+| Discount | 145 | Mon weekly low | +3.3 pts | +0.8 |
 
 The discount-Tuesday-high result runs OPPOSITE to the 12-pattern guide's "Classic Tuesday High" idea, which places the high in premium. Not significant after correction.
 
