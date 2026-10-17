@@ -1,0 +1,1016 @@
+//@version=6
+// ============================================================================
+//  ORB + VWAP Trend Scalper [Pro]
+//  -----------------------------------------------------------------------------
+//  Opening-range breakout on three sessions (Asia / London / New York), filtered
+//  by a VWAP + EMA(50) trend bias, sized by account risk, exited with 3 targets.
+//  Works on futures, forex, CFD and crypto (auto-detected, overridable).
+//
+//  TIME     All sessions, levels and day/week boundaries use New York time.
+//           Trading day starts 18:00 NY. Trading week starts Sunday 18:00 NY.
+//  SIGNALS  Confirmed bar closes only (calc_on_every_tick = false): no repaint,
+//           no lookahead. Levels use this chart's own bars, not request.security.
+//  FILLS    process_orders_on_close = true: a signal on bar N fills at the close
+//           of bar N. Stops and targets are broker-emulated exit orders.
+//           KNOWN LIMIT: when ONE bar touches both the stop and a target, the
+//           order emulator decides the sequence. The stop-first rule cannot be
+//           forced from Pine; such bars are counted in the dashboard.
+//  COSTS    Commission and slippage must be declaration constants in Pine, so
+//           they cannot be inputs. They are shown as an ESTIMATE (Net R est.)
+//           in the dashboard and are NOT applied to strategy P&L.
+//  SIZING   Quantity uses syminfo.pointvalue. FX point values differ by broker:
+//           verify the size once against your broker's contract specification.
+// ============================================================================
+strategy("ORB + VWAP Trend Scalper [Pro]", shorttitle="ORB VWAP Pro", overlay=true,
+     initial_capital=100000, default_qty_type=strategy.fixed, default_qty_value=1,
+     commission_type=strategy.commission.cash_per_order, commission_value=0, slippage=0,
+     margin_long=0, margin_short=0,
+     process_orders_on_close=true, calc_on_every_tick=false,
+     max_lines_count=500, max_labels_count=500, max_boxes_count=500)
+
+// ============================================================================
+// 1. INPUTS
+// ============================================================================
+G_MKT   = "1 · Market"
+G_TIME  = "2 · Time & Sessions"
+G_FLT   = "3 · Filters"
+G_RISK  = "4 · Risk & Sizing"
+G_TP    = "5 · Take Profits"
+G_COST  = "6 · Costs (estimate only)"
+G_LVL   = "7 · Key Levels"
+G_VIS   = "8 · Visuals"
+G_DASH  = "9 · Dashboard"
+G_ALRT  = "10 · Alerts"
+
+// -- Market
+marketIn    = input.string("Auto", "Market type", options=["Auto", "Futures", "Forex", "CFD", "Crypto"], group=G_MKT,
+     tooltip="Auto reads syminfo.type. Override if the data feed labels the symbol unusually.")
+distIn      = input.string("Auto", "Distance unit", options=["Auto", "Points", "Pips", "%"], group=G_MKT,
+     tooltip="Unit used for distances in the dashboard. Auto: Points for futures/CFD, Pips for forex, % for crypto.")
+useVolume   = input.bool(true, "Use volume filter", group=G_MKT,
+     tooltip="Entry needs volume > its 20-bar average. Disabled automatically if the symbol reports no volume.")
+vwapTickVol = input.bool(true, "Use tick volume for VWAP (forex / CFD)", group=G_MKT,
+     tooltip="Forex and most CFDs report TICK volume (count of price changes), not traded volume. Keep ON so VWAP is still weighted. OFF = time-anchored average price. Ignored when no volume is reported.")
+vwapAnchor  = input.string("Day (18:00 NY)", "VWAP anchor", options=["Day (18:00 NY)", "Session"], group=G_MKT)
+weekendCry  = input.bool(false, "Crypto: trade weekends", group=G_MKT,
+     tooltip="OFF = no entries on Saturday and Sunday (NY calendar). Levels still update.")
+lotStep     = input.int(1000, "Forex lot step (units)", minval=1, group=G_MKT,
+     tooltip="Forex quantity is rounded DOWN to multiples of this step.")
+cfdStep     = input.float(0.1, "CFD quantity step", minval=0.0001, group=G_MKT,
+     tooltip="CFD quantity is rounded DOWN to multiples of this step (set to the broker's contract increment).")
+cryptoStep  = input.float(0.001, "Crypto quantity step", minval=0.00000001, group=G_MKT,
+     tooltip="Fractional crypto quantity, rounded DOWN to this precision.")
+
+// -- Time & sessions (input.session format: HHMM-HHMM, New York time)
+sAsia    = input.session("2000-0000", "ASIA session", group=G_TIME)
+sLondon  = input.session("0300-0600", "LONDON session", group=G_TIME)
+sNY      = input.session("0930-1200", "NEW YORK session", group=G_TIME)
+onAsia   = input.bool(true, "Asia enabled", group=G_TIME, inline="a")
+onLondon = input.bool(true, "London enabled", group=G_TIME, inline="l")
+onNY     = input.bool(true, "New York enabled", group=G_TIME, inline="n")
+orAsia   = input.int(15, "Asia opening range (min)", minval=1, maxval=240, group=G_TIME)
+orLondon = input.int(15, "London opening range (min)", minval=1, maxval=240, group=G_TIME)
+orNY     = input.int(15, "New York opening range (min)", minval=1, maxval=240, group=G_TIME)
+eAsia    = input.session("2015-2300", "Asia entry window", group=G_TIME,
+     tooltip="Entries allowed only inside this window (and only after the opening range completes).")
+eLondon  = input.session("0315-0600", "London entry window", group=G_TIME)
+eNY      = input.session("0945-1100", "New York entry window", group=G_TIME)
+
+// -- Filters
+emaLen     = input.int(50, "EMA length (trend)", minval=2, group=G_FLT)
+reqBias    = input.bool(true, "Require trend bias (VWAP + EMA)", group=G_FLT,
+     tooltip="LONG bias: price above VWAP AND above EMA. SHORT bias: below both. Otherwise NEUTRAL = no trades.")
+atrLen     = input.int(14, "ATR length", minval=1, group=G_FLT)
+atrMinMult = input.float(0.5, "Min opening range (× ATR)", minval=0, step=0.1, group=G_FLT,
+     tooltip="Range smaller than this multiple of ATR is treated as noise.")
+atrMaxMult = input.float(3.0, "Max opening range (× ATR)", minval=0, step=0.1, group=G_FLT,
+     tooltip="Range wider than this multiple of ATR gives poor reward-to-risk.")
+volLen     = input.int(20, "Volume average length", minval=2, group=G_FLT)
+
+// -- Risk & sizing
+riskPct    = input.float(1.0, "Risk per trade (% of equity)", minval=0.01, maxval=10, step=0.1, group=G_RISK)
+stopMode   = input.string("Range midpoint", "Stop loss", options=["Range midpoint", "Opposite range side"], group=G_RISK)
+maxPerSess = input.int(1, "Max trades per session", minval=1, group=G_RISK)
+maxPerDay  = input.int(2, "Max trades per day", minval=1, group=G_RISK)
+
+// -- Take profits
+tp1R       = input.float(1.0, "TP1 (R)", minval=0.1, step=0.1, group=G_TP)
+tp2R       = input.float(2.0, "TP2 (R)", minval=0.1, step=0.1, group=G_TP)
+tp3R       = input.float(3.0, "TP3 (R)", minval=0.1, step=0.1, group=G_TP)
+pct1       = input.float(50.0, "TP1 close %", minval=0, maxval=100, group=G_TP)
+pct2       = input.float(30.0, "TP2 close %", minval=0, maxval=100, group=G_TP)
+pct3       = input.float(20.0, "TP3 close %", minval=0, maxval=100, group=G_TP,
+     tooltip="The three percentages must add to 100. The dashboard warns if they do not.")
+fullExitAt = input.string("TP2", "Exit whole position at (if not splittable)", options=["TP1", "TP2", "TP3"], group=G_TP,
+     tooltip="Used when the size cannot be split into three legs (e.g. 1 or 2 futures contracts).")
+beOn       = input.bool(true, "Move stop to breakeven after TP1", group=G_TP)
+
+// -- Costs (estimate only, see header)
+commCash   = input.float(0.0, "Commission per side (money)", minval=0, group=G_COST)
+feePct     = input.float(0.0, "Crypto fee per side (%)", minval=0, step=0.01, group=G_COST)
+spreadIn   = input.float(0.0, "Spread (points; pips for forex)", minval=0, step=0.01, group=G_COST)
+slipTicks  = input.int(1, "Slippage per side (ticks)", minval=0, group=G_COST)
+
+// -- Key levels
+lvlMaster  = input.bool(true, "Show key levels", group=G_LVL)
+lvlPDH     = input.bool(true, "Previous day high / low (PDH · PDL)", group=G_LVL, inline="pd")
+lvlPDL     = input.bool(true, "", group=G_LVL, inline="pd")
+lvlPWH     = input.bool(true, "Previous week high / low (PWH · PWL)", group=G_LVL, inline="pw")
+lvlPWL     = input.bool(true, "", group=G_LVL, inline="pw")
+lvlWOpen   = input.bool(true, "Weekly open (Sun 18:00)", group=G_LVL)
+lvlDOpen   = input.bool(true, "Daily open (18:00)", group=G_LVL)
+lvlMidO    = input.bool(true, "Midnight open (00:00)", group=G_LVL)
+lvl0830    = input.bool(true, "08:30 open", group=G_LVL)
+lvl0930    = input.bool(true, "09:30 open", group=G_LVL)
+declutter  = input.float(0.05, "Merge labels closer than (% of price)", minval=0, step=0.01, group=G_LVL,
+     tooltip="Labels whose prices are this close are merged into one, e.g. 'D OPEN · W OPEN'.")
+
+// -- Visuals
+themeIn     = input.string("Dark", "Theme", options=["Dark", "Light"], group=G_VIS)
+showSess    = input.bool(true, "Session ranges", group=G_VIS)
+showTrades  = input.bool(true, "Trade visualisation", group=G_VIS)
+showBias    = input.bool(true, "VWAP / EMA lines", group=G_VIS)
+showLegend  = input.bool(true, "Legend", group=G_VIS)
+
+// -- Dashboard
+showDash    = input.bool(true, "Show dashboard", group=G_DASH)
+dashPosIn   = input.string("Top Right", "Position", options=["Top Right", "Bottom Right", "Top Left", "Bottom Left"], group=G_DASH)
+secMarket   = input.bool(true, "Section: Market", group=G_DASH)
+secOR       = input.bool(true, "Section: Opening range", group=G_DASH)
+secLevels   = input.bool(true, "Section: Key levels", group=G_DASH)
+secTrade    = input.bool(true, "Section: Active trade", group=G_DASH)
+secPerf     = input.bool(true, "Section: Performance", group=G_DASH)
+secLog      = input.bool(true, "Section: Alert log", group=G_DASH)
+
+// -- Alerts
+alertsOn    = input.bool(true, "Enable alert() calls", group=G_ALRT)
+alertJSON   = input.bool(false, "JSON format (webhooks / bots)", group=G_ALRT)
+alertTouch  = input.bool(false, "Level touch alerts (PDH · PDL · PWH · PWL · D open)", group=G_ALRT)
+
+// ============================================================================
+// 2. MARKET DETECTION, FORMATTING, THEME
+// ============================================================================
+autoMkt = syminfo.type == "futures" ? "Futures" : syminfo.type == "forex" ? "Forex" : syminfo.type == "crypto" ? "Crypto" : "CFD"
+mkt     = marketIn == "Auto" ? autoMkt : marketIn
+isFut   = mkt == "Futures"
+isFx    = mkt == "Forex"
+isCry   = mkt == "Crypto"
+// Forex pip = 10 × mintick on 5-digit (and 3-digit JPY) quotes
+pipSize = syminfo.mintick * 10
+distUnit = distIn == "Auto" ? (isFx ? "Pips" : isCry ? "%" : "Points") : distIn
+tickSz  = syminfo.mintick
+
+// Theme-aware palette (brand colours are constant; neutrals switch with theme)
+isDark  = themeIn == "Dark"
+cTxt    = isDark ? #C9D1E0 : #1F2937
+cMute   = isDark ? #6B7689 : #8A93A3
+cPanel  = isDark ? #0D1119 : #F4F6FA
+cRow    = isDark ? #121826 : #E7ECF3
+cBull   = #22B39A
+cBear   = #E0546B
+cVwap   = #FF7A45
+cEmaUp  = #6FD8C4
+cOpen   = #D8B455
+cPD     = #5B8DEF
+cPW     = #A07CF2
+cAsia   = #6C7CFF
+cLon    = #E9B949
+cNY     = #3FC1D9
+
+// Price and distance formatting (all markets)
+f_px(float x) => str.tostring(x, format.mintick)
+f_two(int x) => x < 10 ? "0" + str.tostring(x) : str.tostring(x)
+f_dist(float d) =>
+    switch distUnit
+        "Pips" => str.tostring(d / pipSize, "#.#") + " pips"
+        "%"    => str.tostring(d / close * 100, "#.##") + "%"
+        => str.tostring(d, format.mintick) + " pts"
+
+// ============================================================================
+// 3. NEW YORK CLOCK, TRADING DAY AND WEEK
+// ============================================================================
+nyH      = hour(time, "America/New_York")
+nyM      = minute(time, "America/New_York")
+nyMin    = nyH * 60 + nyM                                 // minutes since 00:00 NY
+nyDow    = dayofweek(time, "America/New_York")            // 1 = Sunday ... 7 = Saturday
+// NY calendar date as an integer day number (stable across DST)
+nyCalNum = int(timestamp("America/New_York", year(time, "America/New_York"), month(time, "America/New_York"), dayofmonth(time, "America/New_York"), 0, 0) / 86400000)
+// Trading-day number: from 18:00 NY the bar belongs to the NEXT calendar date.
+// Sunday before 18:00 belongs to the previous trading week (Saturday).
+sessNum  = nyCalNum + (nyH >= 18 ? 1 : (nyDow == 1 ? -1 : 0))
+// Trading week: Sunday 18:00 NY. Day number 3 = Sunday (1970-01-01 was a Thursday).
+weekNum  = math.floor((sessNum - 3) / 7)
+newDay   = sessNum != sessNum[1]
+newWeek  = weekNum != weekNum[1]
+newCal   = nyCalNum != nyCalNum[1]
+weekendBlock = isCry and not weekendCry and (nyDow == 1 or nyDow == 7)
+
+// ============================================================================
+// 4. SESSION ENGINE (opening ranges, entry windows, session boxes)
+//    Index 0 = Asia, 1 = London, 2 = New York
+// ============================================================================
+var array<string> sessStr  = array.from(sAsia, sLondon, sNY)
+var array<string> entStr   = array.from(eAsia, eLondon, eNY)
+var array<string> sessName = array.from("ASIA", "LONDON", "NEW YORK")
+var array<color>  sessCol  = array.from(cAsia, cLon, cNY)
+var array<int>    orLenArr = array.from(orAsia, orLondon, orNY)
+var array<bool>   sessOn   = array.from(onAsia, onLondon, onNY)
+var array<float>  orHi     = array.new<float>(3, na)
+var array<float>  orLo     = array.new<float>(3, na)
+var array<bool>   orDone   = array.new<bool>(3, false)
+var array<bool>   orATR    = array.new<bool>(3, false)   // OR size passed the ATR range filter
+var array<bool>   wasIn    = array.new<bool>(3, false)
+var array<bool>   curIn    = array.new<bool>(3, false)   // inside session right now
+var array<bool>   curEnt   = array.new<bool>(3, false)   // inside entry window right now
+var array<int>    orStart  = array.new<int>(3, 0)
+var array<int>    sessTr   = array.new<int>(3, 0)       // trades taken in the current session
+var array<string> sessNote = array.new<string>(3, "")   // why no trade (for the session note)
+var array<box>    orBox    = array.new<box>(3)
+var float tfMin = timeframe.in_seconds() / 60.0
+atrV = ta.atr(atrLen)
+emaV = ta.ema(close, emaLen)
+
+var array<string> evLog = array.new<string>()   // last 5 events for the log table
+
+// Quantity rounding per market (futures = whole contracts, others = step size)
+f_qty(float units) =>
+    step = isFut ? 1.0 : isFx ? float(lotStep) : isCry ? cryptoStep : cfdStep
+    math.floor(units / step) * step
+
+f_log(string msg) =>
+    array.unshift(evLog, f_two(nyH) + ":" + f_two(nyM) + "  " + msg)
+    if array.size(evLog) > 5
+        array.pop(evLog)
+
+// Parse "HHMM-HHMM" into minutes since midnight
+f_start(string s) => str.tonumber(str.substring(s, 0, 2)) * 60 + str.tonumber(str.substring(s, 2, 4))
+f_slen(string s) =>
+    raw = (str.tonumber(str.substring(s, 5, 7)) * 60 + str.tonumber(str.substring(s, 7, 9))) - f_start(s)
+    raw <= 0 ? raw + 1440 : raw
+
+// Updates one session's state for the current bar; returns [started, ended, opening range just completed]
+f_sess_step(int i) =>
+    string sStr = sessStr.get(i)
+    float el    = (nyMin - f_start(sStr) + 1440) % 1440        // minutes elapsed since session start
+    float ln    = f_slen(sStr)
+    bool  inS   = sessOn.get(i) and el < ln and not weekendBlock
+    bool  inE   = inS and ((nyMin - f_start(entStr.get(i)) + 1440) % 1440) < f_slen(entStr.get(i))
+    bool  wasI  = wasIn.get(i)
+    bool  st    = inS and not wasI
+    bool  en    = wasI and not inS
+    bool  orNow = false
+    int   olen  = orLenArr.get(i)
+    curIn.set(i, inS)
+    curEnt.set(i, inE)
+
+    if st
+        // New session: reset its opening range and start the range box
+        orHi.set(i, high)
+        orLo.set(i, low)
+        orDone.set(i, false)
+        orATR.set(i, false)
+        orStart.set(i, bar_index)
+        sessTr.set(i, 0)
+        sessNote.set(i, "")
+        nBars = int(math.max(1, math.ceil(ln / tfMin)))
+        if showSess
+            orBox.set(i, box.new(bar_index, high, bar_index + nBars, low, xloc=xloc.bar_index,
+                 bgcolor=color.new(sessCol.get(i), 93), border_color=color.new(sessCol.get(i), 45), border_width=1))
+
+    if inS and el < olen and not st
+        orHi.set(i, math.max(orHi.get(i), high))
+        orLo.set(i, math.min(orLo.get(i), low))
+
+    if inS and el < olen and showSess and not na(orBox.get(i))
+        box.set_top(orBox.get(i), orHi.get(i))
+        box.set_bottom(orBox.get(i), orLo.get(i))
+
+    if inS and el >= olen and not orDone.get(i)
+        // Opening range complete: apply the ATR range filter once
+        orDone.set(i, true)
+        orNow := true
+        orSize = orHi.get(i) - orLo.get(i)
+        orATR.set(i, atrV > 0 and orSize >= atrMinMult * atrV and orSize <= atrMaxMult * atrV)
+        if showSess
+            midY = (orHi.get(i) + orLo.get(i)) / 2
+            line.new(orStart.get(i), midY, bar_index + int(math.max(1, math.ceil((ln - el) / tfMin))), midY,
+                 xloc=xloc.bar_index, color=color.new(sessCol.get(i), 30), style=line.style_dashed, width=1)
+            label.new(orStart.get(i), orHi.get(i), sessName.get(i) + " OR " + f_px(orHi.get(i)) + " – " + f_px(orLo.get(i)),
+                 xloc=xloc.bar_index, style=label.style_label_down, color=color.new(sessCol.get(i), 80),
+                 textcolor=cTxt, size=size.tiny)
+
+    wasIn.set(i, inS)
+    [st, en, orNow]
+
+// Update all three sessions once per bar (start / end / range-complete flags)
+[st0, en0, or0] = f_sess_step(0)
+[st1, en1, or1] = f_sess_step(1)
+[st2, en2, or2] = f_sess_step(2)
+
+// ============================================================================
+// 5. VWAP, EMA, ATR, VOLUME AND TREND BIAS
+// ============================================================================
+var float cumVol = 0.0
+cumVol += nz(volume)
+hasVolume = cumVol > 0                                        // symbol reports volume at all
+useVolVWAP = hasVolume and (isFut or isCry or vwapTickVol)     // weighted VWAP vs time-anchored average
+volAvg = ta.sma(nz(volume), volLen)
+
+// VWAP accumulators: reset at the 18:00 NY day boundary or at each session start
+sessStartAny = st0 or st1 or st2
+vwapReset    = vwapAnchor == "Day (18:00 NY)" ? newDay : sessStartAny
+hlc3v        = hlc3
+wv           = useVolVWAP ? math.max(nz(volume), 0.0) : 1.0
+var float cPV = 0.0
+var float cV  = 0.0
+var float cP  = 0.0
+var float cP2 = 0.0
+var int   cN  = 0
+var float cPV2 = 0.0   // weighted sum of price^2 for the sigma band
+if vwapReset
+    cPV := 0.0
+    cV  := 0.0
+    cP  := 0.0
+    cP2 := 0.0
+    cN  := 0
+    cPV2 := 0.0
+cPV  += hlc3v * wv
+cV   += wv
+cP   += hlc3v
+cP2  += hlc3v * hlc3v
+cN   += 1
+cPV2 += hlc3v * hlc3v * wv
+vwap = useVolVWAP ? (cV > 0 ? cPV / cV : hlc3v) : (cN > 0 ? cP / cN : hlc3v)
+vwapVar = useVolVWAP ? (cV > 0 ? math.max(cPV2 / cV - vwap * vwap, 0.0) : 0.0) : (cN > 0 ? math.max(cP2 / cN - vwap * vwap, 0.0) : 0.0)
+vwapSd  = math.sqrt(vwapVar)
+volOK   = not useVolume or not hasVolume or nz(volume) > volAvg
+
+longBias  = close > vwap and close > emaV
+shortBias = close < vwap and close < emaV
+biasDir   = longBias ? 1 : shortBias ? -1 : 0
+longOK    = not reqBias or longBias
+shortOK   = not reqBias or shortBias
+emaRising = emaV > emaV[1]
+
+// ============================================================================
+// 6. KEY LEVELS (from this chart's own bars, New York time)
+// ============================================================================
+// Current and previous trading day / week extremes with the bar where they formed
+var float dHi = na
+var float dLo = na
+var int   dHiBar = na
+var int   dLoBar = na
+var float pdHi = na
+var float pdLo = na
+var int   pdHiBar = na
+var int   pdLoBar = na
+var float dOpen = na
+var int   dOpenBar = na
+var float wHi = na
+var float wLo = na
+var int   wHiBar = na
+var int   wLoBar = na
+var float pwHi = na
+var float pwLo = na
+var int   pwHiBar = na
+var int   pwLoBar = na
+var float wOpen = na
+var int   wOpenBar = na
+var float midO = na
+var int   midOBar = na
+var float o0830 = na
+var int   o0830Bar = na
+var float o0930 = na
+var int   o0930Bar = na
+var bool  got0830 = false
+var bool  got0930 = false
+
+// Key-level rays: created per trading day, deleted when the day rolls
+var array<line> lvlLines = array.new<line>()
+var array<bool> touched  = array.new<bool>(5, false)
+
+if newDay
+    pdHi := dHi
+    pdLo := dLo
+    pdHiBar := dHiBar
+    pdLoBar := dLoBar
+    dHi := high
+    dLo := low
+    dHiBar := bar_index
+    dLoBar := bar_index
+    dOpen := open
+    dOpenBar := bar_index
+    for lnObj in lvlLines
+        line.delete(lnObj)
+    lvlLines.clear()
+    for k = 0 to 4
+        touched.set(k, false)
+else
+    if high > dHi
+        dHi := high
+        dHiBar := bar_index
+    if low < dLo
+        dLo := low
+        dLoBar := bar_index
+
+if newWeek
+    pwHi := wHi
+    pwLo := wLo
+    pwHiBar := wHiBar
+    pwLoBar := wLoBar
+    wHi := high
+    wLo := low
+    wHiBar := bar_index
+    wLoBar := bar_index
+    wOpen := open
+    wOpenBar := bar_index
+else
+    if high > wHi
+        wHi := high
+        wHiBar := bar_index
+    if low < wLo
+        wLo := low
+        wLoBar := bar_index
+
+if newCal
+    midO := open
+    midOBar := bar_index
+    got0830 := false
+    got0930 := false
+if not got0830 and nyMin >= 510
+    o0830 := open
+    o0830Bar := bar_index
+    got0830 := true
+if not got0930 and nyMin >= 570
+    o0930 := open
+    o0930Bar := bar_index
+    got0930 := true
+
+// Draw day / week rays when the day rolls (start at formation bar, extend right)
+if newDay and lvlMaster
+    if lvlPDH and not na(pdHi)
+        lvlLines.push(line.new(pdHiBar, pdHi, bar_index, pdHi, xloc=xloc.bar_index, extend=extend.right, color=cPD, width=1))
+    if lvlPDL and not na(pdLo)
+        lvlLines.push(line.new(pdLoBar, pdLo, bar_index, pdLo, xloc=xloc.bar_index, extend=extend.right, color=cPD, width=1))
+    if lvlDOpen and not na(dOpen)
+        lvlLines.push(line.new(dOpenBar, dOpen, bar_index, dOpen, xloc=xloc.bar_index, extend=extend.right, color=cOpen, style=line.style_dotted, width=1))
+    if lvlPWH and not na(pwHi)
+        lvlLines.push(line.new(pwHiBar, pwHi, bar_index, pwHi, xloc=xloc.bar_index, extend=extend.right, color=cPW, style=line.style_dashed, width=1))
+    if lvlPWL and not na(pwLo)
+        lvlLines.push(line.new(pwLoBar, pwLo, bar_index, pwLo, xloc=xloc.bar_index, extend=extend.right, color=cPW, style=line.style_dashed, width=1))
+    if lvlWOpen and not na(wOpen)
+        lvlLines.push(line.new(wOpenBar, wOpen, bar_index, wOpen, xloc=xloc.bar_index, extend=extend.right, color=cOpen, style=line.style_dotted, width=1))
+if newCal and lvlMaster and lvlMidO
+    lvlLines.push(line.new(midOBar, midO, bar_index, midO, xloc=xloc.bar_index, extend=extend.right, color=cOpen, style=line.style_dotted, width=1))
+if got0830 and o0830Bar == bar_index and lvlMaster and lvl0830
+    lvlLines.push(line.new(o0830Bar, o0830, bar_index, o0830, xloc=xloc.bar_index, extend=extend.right, color=cOpen, style=line.style_dotted, width=1))
+if got0930 and o0930Bar == bar_index and lvlMaster and lvl0930
+    lvlLines.push(line.new(o0930Bar, o0930, bar_index, o0930, xloc=xloc.bar_index, extend=extend.right, color=cOpen, style=line.style_dotted, width=1))
+
+// ============================================================================
+// 7. SESSION UPDATE, ENTRY DECISION AND ORDER PLACEMENT
+// ============================================================================
+// Opening-range completion events
+if or0 or or1 or or2
+    for i = 0 to 2
+        orFlag = i == 0 ? or0 : i == 1 ? or1 : or2
+        if orFlag
+            msg = "OR READY | " + sessName.get(i) + " | " + f_px(orHi.get(i)) + " – " + f_px(orLo.get(i)) + " | size " + f_dist(orHi.get(i) - orLo.get(i))
+            f_log(msg)
+
+// Session end: note why nothing was traded (and remember the note for the chart)
+for i = 0 to 2
+    enFlag = i == 0 ? en0 : i == 1 ? en1 : en2
+    if enFlag and sessTr.get(i) == 0 and showSess
+        label.new(orStart.get(i), orLo.get(i), "No trade · " + (sessNote.get(i) == "" ? "no breakout" : sessNote.get(i)),
+             xloc=xloc.bar_index, style=label.style_label_up, color=color.new(cMute, 100), textcolor=cMute, size=size.tiny)
+
+// Active session: first session that is inside its entry window with a completed range
+var int candSess = -1
+candSess := -1
+for i = 0 to 2
+    if candSess == -1 and curIn.get(i) and curEnt.get(i) and orDone.get(i)
+        candSess := i
+
+// Per-day trade counter
+var int dayTrades = 0
+if newDay
+    dayTrades := 0
+
+// Position state (one position at a time)
+var int   pDir    = 0        // 1 long, -1 short, 0 flat
+var int   pSess   = -1
+var float pEntry  = na
+var float pSL     = na
+var float pR      = na       // price risk per unit
+var float pRisk   = na       // money risked
+var float pTP1    = na
+var float pTP2    = na
+var float pTP3    = na
+var float pQ1     = na
+var float pQ2     = na
+var float pQ3     = na
+var bool  pSplit  = true
+var bool  pTP1Hit = false
+var bool  pTP2Hit = false
+var bool  pTP3Hit = false
+var bool  pBE     = false
+var int   pEntryBar = na
+var float pQty    = na
+var line  lnE     = na
+var line  lnSL    = na
+var line  lnT1    = na
+var line  lnT2    = na
+var line  lnT3    = na
+var box   bxProf  = na
+var box   bxRisk  = na
+var array<float> trRisk = array.new<float>()    // money risked per trade (aligned with closed trades)
+var array<int>   trSess = array.new<int>()      // session index per trade
+
+
+// Candidate signal for the active session
+var string blockWhy = ""
+blockWhy := ""
+sigLong  = false
+sigShort = false
+if candSess >= 0
+    hiC = orHi.get(candSess)
+    loC = orLo.get(candSess)
+    atrPass = orATR.get(candSess)
+    sigLong  := close > hiC and close[1] <= hiC and longOK and volOK and atrPass
+    sigShort := close < loC and close[1] >= loC and shortOK and volOK and atrPass
+    // Why a breakout is not taken (shown in the session note and dashboard)
+    if not (close > hiC or close < loC)
+        blockWhy := "no breakout yet"
+    else if not atrPass
+        blockWhy := "range outside ATR filter"
+    else if not volOK
+        blockWhy := "volume filter"
+    else if not (longOK or shortOK)
+        blockWhy := "bias neutral"
+    else if sessTr.get(candSess) >= maxPerSess
+        blockWhy := "max trades / session"
+    else if dayTrades >= maxPerDay
+        blockWhy := "max trades / day"
+    sessNote.set(candSess, blockWhy)
+
+if weekendBlock
+    blockWhy := "crypto weekend closed"
+
+canTrade = pDir == 0 and strategy.position_size == 0 and not weekendBlock and dayTrades < maxPerDay
+trigger  = canTrade and (sigLong or sigShort)
+if trigger
+    isL     = sigLong
+    entryPx = close
+    hiC     = orHi.get(candSess)
+    loC     = orLo.get(candSess)
+    slPx    = stopMode == "Range midpoint" ? (hiC + loC) / 2 : (isL ? loC : hiC)
+    rPx     = math.abs(entryPx - slPx)
+    validStop = rPx > 0 and (isL ? slPx < entryPx : slPx > entryPx)
+    riskMoney = strategy.equity * riskPct / 100
+    units     = riskMoney / (rPx * syminfo.pointvalue)
+    qty       = isFut ? math.floor(units) : f_qty(units)
+    qtyOK     = qty > 0
+    if validStop and qtyOK
+        // TP levels (R multiples from entry)
+        tp1 = isL ? entryPx + tp1R * rPx : entryPx - tp1R * rPx
+        tp2 = isL ? entryPx + tp2R * rPx : entryPx - tp2R * rPx
+        tp3 = isL ? entryPx + tp3R * rPx : entryPx - tp3R * rPx
+        // Leg sizes; futures need >= 1 contract per leg, otherwise exit whole position at fullExitAt
+        q1 = isFut ? math.floor(qty * pct1 / 100) : f_qty(qty * pct1 / 100)
+        q2 = isFut ? math.floor(qty * pct2 / 100) : f_qty(qty * pct2 / 100)
+        q3 = qty - q1 - q2
+        split = q1 > 0 and q2 > 0 and q3 > 0
+        idL = isL ? "L" : "S"
+        if isL
+            strategy.entry("L", strategy.long, qty=qty, comment="ORB " + sessName.get(candSess))
+        else
+            strategy.entry("S", strategy.short, qty=qty, comment="ORB " + sessName.get(candSess))
+        if split
+            strategy.exit("TP1", idL, qty=q1, limit=tp1, stop=slPx, comment="TP1")
+            strategy.exit("TP2", idL, qty=q2, limit=tp2, stop=slPx, comment="TP2")
+            strategy.exit("TP3", idL, qty=q3, limit=tp3, stop=slPx, comment="TP3")
+        else
+            tpSel = fullExitAt == "TP1" ? tp1 : fullExitAt == "TP2" ? tp2 : tp3
+            strategy.exit("FULL", idL, qty=qty, limit=tpSel, stop=slPx, comment="FULL")
+        // Record state
+        pDir    := isL ? 1 : -1
+        pEntryBar := bar_index
+        pQty    := qty
+        pSess   := candSess
+        pEntry  := entryPx
+        pSL     := slPx
+        pR      := rPx
+        pRisk   := riskMoney
+        pTP1    := tp1
+        pTP2    := tp2
+        pTP3    := tp3
+        pQ1     := q1
+        pQ2     := q2
+        pQ3     := q3
+        pSplit  := split
+        pTP1Hit := false
+        pTP2Hit := false
+        pTP3Hit := false
+        pBE     := false
+        trRisk.push(riskMoney)
+        trSess.push(candSess)
+        sessTr.set(candSess, sessTr.get(candSess) + 1)
+        dayTrades += 1
+        blockWhy := ""
+
+        // Trade visuals: entry, stop, targets and profit / risk zones
+        if showTrades
+            lnE  := line.new(bar_index, entryPx, bar_index, entryPx, xloc=xloc.bar_index, color=color.white, width=1)
+            lnSL := line.new(bar_index, slPx, bar_index, slPx, xloc=xloc.bar_index, color=cBear, width=1)
+            lnT1 := line.new(bar_index, tp1, bar_index, tp1, xloc=xloc.bar_index, color=color.new(cBull, 40), style=line.style_dashed, width=1)
+            lnT2 := line.new(bar_index, tp2, bar_index, tp2, xloc=xloc.bar_index, color=color.new(cBull, 20), style=line.style_dashed, width=1)
+            lnT3 := line.new(bar_index, tp3, bar_index, tp3, xloc=xloc.bar_index, color=cBull, style=line.style_dashed, width=1)
+            bxProf := box.new(bar_index, math.max(entryPx, tp3), bar_index, math.min(entryPx, tp3), xloc=xloc.bar_index,
+                 bgcolor=color.new(cBull, 90), border_color=na)
+            bxRisk := box.new(bar_index, math.max(entryPx, slPx), bar_index, math.min(entryPx, slPx), xloc=xloc.bar_index,
+                 bgcolor=color.new(cBear, 90), border_color=na)
+            label.new(bar_index, isL ? low : high, isL ? "LONG" : "SHORT", xloc=xloc.bar_index,
+                 style=isL ? label.style_label_up : label.style_label_down,
+                 color=isL ? cBull : cBear, textcolor=color.white, size=size.small,
+                 tooltip="Session: " + sessName.get(candSess) + "\nEntry: " + f_px(entryPx) + "\nSL: " + f_px(slPx) +
+                 "\nTP1: " + f_px(tp1) + "\nTP2: " + f_px(tp2) + "\nTP3: " + f_px(tp3) + "\nQty: " + str.tostring(qty))
+        f_log((isL ? "LONG" : "SHORT") + " | " + sessName.get(candSess) + " | entry " + f_px(entryPx) + " | SL " + f_px(slPx) + " | qty " + str.tostring(qty))
+        if alertsOn
+            msg = alertJSON ?
+                 "{\"event\":\"entry\",\"side\":\"" + (isL ? "long" : "short") + "\",\"session\":\"" + sessName.get(candSess) +
+                 "\",\"symbol\":\"" + syminfo.ticker + "\",\"market_type\":\"" + mkt + "\",\"timeframe\":\"" + timeframe.period +
+                 "\",\"time_ny\":\"" + f_two(nyH) + ":" + f_two(nyM) + "\",\"entry\":" + str.tostring(entryPx, format.mintick) +
+                 ",\"sl\":" + str.tostring(slPx, format.mintick) + ",\"tp\":[" + str.tostring(tp1, format.mintick) + "," +
+                 str.tostring(tp2, format.mintick) + "," + str.tostring(tp3, format.mintick) + "],\"quantity\":" + str.tostring(qty) + "}"
+                 : (isL ? "LONG" : "SHORT") + " | " + sessName.get(candSess) + " | " + syminfo.ticker + " " + timeframe.period +
+                 " | Entry " + f_px(entryPx) + " | SL " + f_px(slPx) + " | TP1 " + f_px(tp1) + " | TP2 " + f_px(tp2) +
+                 " | TP3 " + f_px(tp3) + " | Qty " + str.tostring(qty)
+            alert(msg, alert.freq_once_per_bar_close)
+    else
+        blockWhy := validStop ? "size < 1 contract (risk too large)" : "invalid stop"
+        if not qtyOK and validStop and isFut
+            blockWhy := "Risk too large for 1 contract"
+        sessNote.set(candSess, blockWhy)
+
+// ============================================================================
+// 8. TRADE MANAGEMENT: TP tracking, breakeven, session-end close, outcomes
+// ============================================================================
+inTrade = pDir != 0 and strategy.position_size != 0
+if inTrade
+    // Track which targets were reached on this bar (for labels, breakeven and live R)
+    if pDir == 1
+        if not pTP1Hit and high >= pTP1
+            pTP1Hit := true
+            f_log("TP1 hit | " + f_px(pTP1))
+            if showTrades
+                label.new(bar_index, pTP1, "TP1 ✓", xloc=xloc.bar_index, style=label.style_circle, color=cBull, textcolor=color.white, size=size.tiny)
+            if beOn and pSplit
+                // Stop for the remaining legs moves to entry (breakeven)
+                strategy.exit("TP2", "L", qty=pQ2, limit=pTP2, stop=pEntry, comment="TP2")
+                strategy.exit("TP3", "L", qty=pQ3, limit=pTP3, stop=pEntry, comment="TP3")
+                pBE := true
+        if not pTP2Hit and high >= pTP2
+            pTP2Hit := true
+            f_log("TP2 hit | " + f_px(pTP2))
+            if showTrades
+                label.new(bar_index, pTP2, "TP2 ✓", xloc=xloc.bar_index, style=label.style_circle, color=cBull, textcolor=color.white, size=size.tiny)
+        if not pTP3Hit and high >= pTP3
+            pTP3Hit := true
+            f_log("TP3 hit | " + f_px(pTP3))
+            if showTrades
+                label.new(bar_index, pTP3, "TP3 ✓", xloc=xloc.bar_index, style=label.style_circle, color=cBull, textcolor=color.white, size=size.tiny)
+    else
+        if not pTP1Hit and low <= pTP1
+            pTP1Hit := true
+            f_log("TP1 hit | " + f_px(pTP1))
+            if showTrades
+                label.new(bar_index, pTP1, "TP1 ✓", xloc=xloc.bar_index, style=label.style_circle, color=cBull, textcolor=color.white, size=size.tiny)
+            if beOn and pSplit
+                strategy.exit("TP2", "S", qty=pQ2, limit=pTP2, stop=pEntry, comment="TP2")
+                strategy.exit("TP3", "S", qty=pQ3, limit=pTP3, stop=pEntry, comment="TP3")
+                pBE := true
+        if not pTP2Hit and low <= pTP2
+            pTP2Hit := true
+            f_log("TP2 hit | " + f_px(pTP2))
+            if showTrades
+                label.new(bar_index, pTP2, "TP2 ✓", xloc=xloc.bar_index, style=label.style_circle, color=cBull, textcolor=color.white, size=size.tiny)
+        if not pTP3Hit and low <= pTP3
+            pTP3Hit := true
+            f_log("TP3 hit | " + f_px(pTP3))
+            if showTrades
+                label.new(bar_index, pTP3, "TP3 ✓", xloc=xloc.bar_index, style=label.style_circle, color=cBull, textcolor=color.white, size=size.tiny)
+    // Extend the trade drawings to the current bar
+    if showTrades and not na(lnE)
+        line.set_x2(lnE, bar_index)
+        line.set_x2(lnSL, bar_index)
+        line.set_x2(lnT1, bar_index)
+        line.set_x2(lnT2, bar_index)
+        line.set_x2(lnT3, bar_index)
+        box.set_right(bxProf, bar_index)
+        box.set_right(bxRisk, bar_index)
+
+// Forced close at the end of the trade's session
+endOfPosSess = (pSess == 0 and en0) or (pSess == 1 and en1) or (pSess == 2 and en2)
+forcedNow = inTrade and endOfPosSess
+if forcedNow
+    strategy.close_all(comment="Session end")
+    f_log("SESSION END | forced close")
+
+// Trade closed (position went flat): record outcome, stats and drawings
+justClosed = pDir != 0 and strategy.position_size == 0 and bar_index > pEntryBar and strategy.closedtrades > 0
+if justClosed
+    n      = strategy.closedtrades
+    exitPx = strategy.closedtrades.exit_price(n - 1)
+    exitId = strategy.closedtrades.exit_id(n - 1)
+    profit = strategy.closedtrades.profit(n - 1)
+    rTrade = pRisk > 0 ? profit / pRisk : 0.0
+    isStop = math.abs(exitPx - pSL) <= tickSz * 2
+    isBE   = pBE and math.abs(exitPx - pEntry) <= tickSz * 2
+    outcome = forcedNow ? "SESSION ✕" : isBE ? "BE ✕" : isStop ? "SL ✕" :
+              math.abs(exitPx - pTP3) <= tickSz * 2 ? "TP3 ✓" :
+              math.abs(exitPx - pTP2) <= tickSz * 2 ? "TP2 ✓" :
+              math.abs(exitPx - pTP1) <= tickSz * 2 ? "TP1 ✓" : "EXIT"
+    if showTrades
+        label.new(bar_index, exitPx, outcome + "  " + str.tostring(rTrade, "+0.00;-0.00") + "R", xloc=xloc.bar_index,
+             style=isBE or isStop or forcedNow ? label.style_xcross : label.style_label_left,
+             color=color.new(profit >= 0 ? cBull : cBear, 15), textcolor=color.white, size=size.tiny)
+    f_log("CLOSED | " + outcome + " | " + str.tostring(rTrade, "+0.00;-0.00") + "R | " + exitId)
+    if alertsOn
+        msgX = alertJSON ?
+             "{\"event\":\"exit\",\"outcome\":\"" + outcome + "\",\"symbol\":\"" + syminfo.ticker + "\",\"time_ny\":\"" +
+             f_two(nyH) + ":" + f_two(nyM) + "\",\"exit\":" + str.tostring(exitPx, format.mintick) + ",\"r\":" + str.tostring(rTrade, "0.00") + "}"
+             : outcome + " | " + syminfo.ticker + " | exit " + f_px(exitPx) + " | " + str.tostring(rTrade, "+0.00;-0.00") + "R"
+        alert(msgX, alert.freq_once_per_bar_close)
+    pDir := 0
+    pSess := -1
+    if showTrades
+        lnE := na
+        lnSL := na
+        lnT1 := na
+        lnT2 := na
+        lnT3 := na
+
+// ============================================================================
+// 9. KEY LEVEL LABELS (last bar only, merged and nudged so they never overlap)
+// ============================================================================
+var array<label> lvlLabels = array.new<label>()
+if barstate.islast
+    for lb in lvlLabels
+        label.delete(lb)
+    lvlLabels.clear()
+var array<float>  lp = array.new<float>()
+var array<string> ln = array.new<string>()
+var array<color>  lc = array.new<color>()
+if barstate.islast and lvlMaster
+    // Collect active levels
+    lp.clear()
+    ln.clear()
+    lc.clear()
+    if lvlPDH and not na(pdHi)
+        lp.push(pdHi)
+        ln.push("PDH")
+        lc.push(cPD)
+    if lvlPDL and not na(pdLo)
+        lp.push(pdLo)
+        ln.push("PDL")
+        lc.push(cPD)
+    if lvlPWH and not na(pwHi)
+        lp.push(pwHi)
+        ln.push("PWH")
+        lc.push(cPW)
+    if lvlPWL and not na(pwLo)
+        lp.push(pwLo)
+        ln.push("PWL")
+        lc.push(cPW)
+    if lvlWOpen and not na(wOpen)
+        lp.push(wOpen)
+        ln.push("W OPEN")
+        lc.push(cOpen)
+    if lvlDOpen and not na(dOpen)
+        lp.push(dOpen)
+        ln.push("D OPEN")
+        lc.push(cOpen)
+    if lvlMidO and not na(midO)
+        lp.push(midO)
+        ln.push("00:00")
+        lc.push(cOpen)
+    if lvl0830 and got0830
+        lp.push(o0830)
+        ln.push("08:30")
+        lc.push(cOpen)
+    if lvl0930 and got0930
+        lp.push(o0930)
+        ln.push("09:30")
+        lc.push(cOpen)
+    // Insertion sort by price (ascending)
+    nL = lp.size()
+    if nL > 1
+        for i = 1 to nL - 1
+            j = i
+            while j > 0 and lp.get(j - 1) > lp.get(j)
+                tp = lp.get(j)
+                lp.set(j, lp.get(j - 1))
+                lp.set(j - 1, tp)
+                tn = ln.get(j)
+                ln.set(j, ln.get(j - 1))
+                ln.set(j - 1, tn)
+                tc = lc.get(j)
+                lc.set(j, lc.get(j - 1))
+                lc.set(j - 1, tc)
+                j := j - 1
+    // Merge levels closer than the declutter distance into one label
+    mP = array.new<float>()
+    mT = array.new<string>()
+    mC = array.new<color>()
+    mPx = array.new<float>()    // real price shown in the label text
+    if nL > 0
+        for i = 0 to nL - 1
+            p = lp.get(i)
+            if mP.size() > 0 and p - mP.get(mP.size() - 1) <= close * declutter / 100
+                last = mP.size() - 1
+                mT.set(last, mT.get(last) + " · " + ln.get(i))
+                mPx.set(last, (mPx.get(last) + p) / 2)
+                mP.set(last, (mP.get(last) + p) / 2)
+            else
+                mP.push(p)
+                mPx.push(p)
+                mT.push(ln.get(i))
+                mC.push(lc.get(i))
+    // Nudge labels upward so no two are closer than a fraction of ATR
+    minGap = atrV * 0.22
+    if mP.size() > 1
+        for i = 1 to mP.size() - 1
+            if mP.get(i) - mP.get(i - 1) < minGap
+                mP.set(i, mP.get(i - 1) + minGap)
+    // Draw one aligned column just right of the last candle
+    if mP.size() > 0
+        for i = 0 to mP.size() - 1
+            lvlLabels.push(label.new(bar_index + 4, mP.get(i), mT.get(i) + "  " + f_px(mPx.get(i)), xloc=xloc.bar_index,
+                 style=label.style_label_left, color=color.new(mC.get(i), 100), textcolor=mC.get(i), size=size.tiny))
+
+// Level touch alerts (once per trading day per level)
+if alertTouch and alertsOn
+    lvlPx = array.from(pdHi, pdLo, pwHi, pwLo, dOpen)
+    lvlNm = array.from("PDH", "PDL", "PWH", "PWL", "D OPEN")
+    for k = 0 to 4
+        px = lvlPx.get(k)
+        if not na(px) and not touched.get(k) and low <= px and high >= px
+            touched.set(k, true)
+            alert((alertJSON ? "{\"event\":\"level_touch\",\"level\":\"" + lvlNm.get(k) + "\",\"price\":" + str.tostring(px, format.mintick) + "}"
+                 : lvlNm.get(k) + " touched | " + f_px(px) + " | " + syminfo.ticker + " " + timeframe.period), alert.freq_once_per_bar_close)
+
+// Session opening-range and bias alerts
+if alertsOn
+    if or0 or or1 or or2
+        for i = 0 to 2
+            orFlag = i == 0 ? or0 : i == 1 ? or1 : or2
+            if orFlag
+                alert((alertJSON ? "{\"event\":\"or_complete\",\"session\":\"" + sessName.get(i) + "\",\"high\":" + str.tostring(orHi.get(i), format.mintick) + ",\"low\":" + str.tostring(orLo.get(i), format.mintick) + "}"
+                     : "OR READY | " + sessName.get(i) + " | " + syminfo.ticker + " | " + f_px(orHi.get(i)) + " – " + f_px(orLo.get(i)) + " | size " + f_dist(orHi.get(i) - orLo.get(i))), alert.freq_once_per_bar_close)
+
+var int prevBias = 0
+if alertsOn and biasDir != prevBias
+    alert((alertJSON ? "{\"event\":\"bias_change\",\"bias\":\"" + (biasDir == 1 ? "long" : biasDir == -1 ? "short" : "neutral") + "\"}"
+         : "BIAS " + (biasDir == 1 ? "LONG" : biasDir == -1 ? "SHORT" : "NEUTRAL") + " | " + syminfo.ticker + " " + timeframe.period), alert.freq_once_per_bar_close)
+prevBias := biasDir
+
+// ============================================================================
+// 10. PERFORMANCE STATISTICS (computed from broker-closed trades)
+// ============================================================================
+nTr      = strategy.closedtrades
+nWin     = strategy.wintrades
+winPct   = nTr > 0 ? nWin / nTr * 100 : na
+profFac  = strategy.grossloss > 0 ? strategy.grossprofit / strategy.grossloss : na
+float sumR = 0.0
+sessWin  = array.new<int>(3, 0)
+sessCnt  = array.new<int>(3, 0)
+if nTr > 0
+    for t = 0 to nTr - 1
+        pr = strategy.closedtrades.profit(t)
+        rk = t < trRisk.size() ? trRisk.get(t) : 0.0
+        sumR := sumR + (rk > 0 ? pr / rk : 0.0)
+        si = t < trSess.size() ? trSess.get(t) : 0
+        sessCnt.set(si, sessCnt.get(si) + 1)
+        if pr > 0
+            sessWin.set(si, sessWin.get(si) + 1)
+avgR = nTr > 0 ? sumR / nTr : na
+// Shared "net R" estimate: costs per trade as a fraction of the money risked
+spreadPx  = isFx ? spreadIn * pipSize : spreadIn                     // spread in price units
+costPxR   = (spreadPx + 2 * slipTicks * tickSz + (isCry ? 2 * feePct / 100 * pEntry : 0.0)) / pR   // per trade, in R
+costMnyR  = pRisk > 0 ? 2 * commCash / pRisk : 0.0                    // commission in R
+costR     = pR > 0 ? costPxR + costMnyR : na
+liveR     = pDir != 0 and pR > 0 ? pDir * (close - pEntry) / pR : na
+splitWarn = math.abs(pct1 + pct2 + pct3 - 100) > 0.01
+
+// ============================================================================
+// 11. PLOTS (VWAP, bands, EMA, session strip)
+// ============================================================================
+vwapCol = color.new(cVwap, 0)
+plot(showBias ? vwap : na, "VWAP", color=vwapCol, linewidth=2)
+pU = plot(showBias ? vwap + vwapSd : na, "VWAP +1σ", color=color.new(cVwap, 85))
+pL = plot(showBias ? vwap - vwapSd : na, "VWAP −1σ", color=color.new(cVwap, 85))
+fill(pU, pL, color=color.new(cVwap, 94), title="VWAP band")
+plot(showBias ? emaV : na, "EMA", color=emaRising ? cEmaUp : cBear, linewidth=2)
+plotshape(showSess and curIn.get(0), "Asia strip", shape.square, location.top, cAsia, size=size.tiny)
+plotshape(showSess and curIn.get(1), "London strip", shape.square, location.top, cLon, size=size.tiny)
+plotshape(showSess and curIn.get(2), "NY strip", shape.square, location.top, cNY, size=size.tiny)
+
+// ============================================================================
+// 12. DASHBOARD AND LEGEND (last bar only)
+// ============================================================================
+var table dash   = table.new(position.top_right, 2, 52, bgcolor=cPanel, frame_color=cRow, frame_width=1, border_width=0)
+var table logT   = table.new(position.bottom_right, 1, 8, bgcolor=cPanel, frame_color=cRow, frame_width=1, border_width=0)
+var table legend = table.new(position.top_left, 1, 3, bgcolor=color.new(cPanel, 15), border_width=0)
+
+f_row(table t, int r, string l, string v, color vc) =>
+    bgc = r % 2 == 0 ? cRow : cPanel
+    table.cell(t, 0, r, l, text_color=cMute, text_size=size.small, text_halign=text.align_left, bgcolor=bgc)
+    table.cell(t, 1, r, v, text_color=vc, text_size=size.small, text_halign=text.align_right, bgcolor=bgc)
+    r + 1
+
+f_head(table t, int r, string title) =>
+    table.cell(t, 0, r, title, text_color=cTxt, text_size=size.small, text_halign=text.align_left, bgcolor=color.new(cMute, 80))
+    table.cell(t, 1, r, "", bgcolor=color.new(cMute, 80))
+    r + 1
+
+if barstate.islast and showDash
+    // Position of the dashboard (log table goes to the opposite vertical side)
+    topSide = dashPosIn == "Top Right" or dashPosIn == "Top Left"
+    dashPos = dashPosIn == "Top Right" ? position.top_right : dashPosIn == "Bottom Right" ? position.bottom_right :
+              dashPosIn == "Top Left" ? position.top_left : position.bottom_left
+    logPos  = topSide ? position.bottom_right : position.top_right
+    activeSess = candSess >= 0 ? sessName.get(candSess) : "—"
+    biasTxt = biasDir == 1 ? "LONG" : biasDir == -1 ? "SHORT" : "NEUTRAL"
+    biasCol = biasDir == 1 ? cBull : biasDir == -1 ? cBear : cMute
+    volTxt  = not hasVolume ? "NO VOLUME · filter off" : useVolVWAP ? (isFut or isCry ? "real volume" : "tick volume") : "tick (not in VWAP)"
+    r = 0
+    r = f_head(dash, r, "ORB · VWAP TREND SCALPER  ·  PRO")
+    r = f_row(dash, r, "Symbol · TF", syminfo.ticker + " · " + timeframe.period, cTxt)
+    if secMarket
+        r = f_row(dash, r, "Market", mkt + (marketIn == "Auto" ? " (auto)" : ""), cTxt)
+        r = f_row(dash, r, "NY time", f_two(nyH) + ":" + f_two(nyM) + "  " + activeSess, cTxt)
+        r = f_row(dash, r, "Trend bias", biasTxt, biasCol)
+        r = f_row(dash, r, "Price vs VWAP", (close >= vwap ? "above" : "below") + "  " + f_dist(math.abs(close - vwap)), close >= vwap ? cBull : cBear)
+        r = f_row(dash, r, "EMA slope", emaRising ? "rising" : "falling", emaRising ? cEmaUp : cBear)
+        r = f_row(dash, r, "Volume", volTxt, hasVolume ? cTxt : cMute)
+        r = f_row(dash, r, "ATR filter", candSess >= 0 ? (orATR.get(candSess) ? "pass" : "blocked") : "—", candSess >= 0 and orATR.get(candSess) ? cBull : cMute)
+        r = f_row(dash, r, "Status", weekendBlock ? "weekend closed" : blockWhy == "" ? "watching" : blockWhy, cMute)
+    if secOR
+        orIdx = candSess >= 0 ? candSess : 0
+        r = f_head(dash, r, "OPENING RANGE")
+        r = f_row(dash, r, "Session", sessName.get(orIdx), sessCol.get(orIdx))
+        r = f_row(dash, r, "OR high", orDone.get(orIdx) ? f_px(orHi.get(orIdx)) : "building", cBull)
+        r = f_row(dash, r, "OR low", orDone.get(orIdx) ? f_px(orLo.get(orIdx)) : "building", cBear)
+        orSz = orHi.get(orIdx) - orLo.get(orIdx)
+        r = f_row(dash, r, "Size", na(orSz) ? "—" : f_dist(orSz), cTxt)
+        r = f_row(dash, r, "Size × ATR", na(orSz) or atrV == 0 ? "—" : str.tostring(orSz / atrV, "0.00") + "×", cTxt)
+    if secLevels
+        r = f_head(dash, r, "KEY LEVELS  (distance from price)")
+        r = f_row(dash, r, "● PWH  " + (na(pwHi) ? "—" : f_px(pwHi)), na(pwHi) ? "—" : f_dist(pwHi - close), cPW)
+        r = f_row(dash, r, "● PDH  " + (na(pdHi) ? "—" : f_px(pdHi)), na(pdHi) ? "—" : f_dist(pdHi - close), cPD)
+        r = f_row(dash, r, "● 00:00 open  " + (na(midO) ? "—" : f_px(midO)), na(midO) ? "—" : f_dist(midO - close), cOpen)
+        r = f_row(dash, r, "● PDL  " + (na(pdLo) ? "—" : f_px(pdLo)), na(pdLo) ? "—" : f_dist(pdLo - close), cPD)
+        r = f_row(dash, r, "● PWL  " + (na(pwLo) ? "—" : f_px(pwLo)), na(pwLo) ? "—" : f_dist(pwLo - close), cPW)
+    if secTrade
+        r = f_head(dash, r, "ACTIVE TRADE")
+        if pDir == 0
+            r = f_row(dash, r, "Position", "No active trade", cMute)
+        else
+            dirTxt = (pDir == 1 ? "LONG" : "SHORT") + "  ·  " + sessName.get(pSess)
+            r = f_row(dash, r, "Position", dirTxt, pDir == 1 ? cBull : cBear)
+            r = f_row(dash, r, "Entry", f_px(pEntry), cTxt)
+            r = f_row(dash, r, "Stop", f_px(pSL) + (pBE ? "  (BE)" : ""), pBE ? cOpen : cBear)
+            r = f_row(dash, r, "TP1  " + str.tostring(tp1R, "0.0") + "R · " + str.tostring(pct1, "0") + "%", f_px(pTP1) + (pTP1Hit ? "  ✓" : ""), pTP1Hit ? cBull : cTxt)
+            r = f_row(dash, r, "TP2  " + str.tostring(tp2R, "0.0") + "R · " + str.tostring(pct2, "0") + "%", f_px(pTP2) + (pTP2Hit ? "  ✓" : ""), pTP2Hit ? cBull : cTxt)
+            r = f_row(dash, r, "TP3  " + str.tostring(tp3R, "0.0") + "R · " + str.tostring(pct3, "0") + "%", f_px(pTP3) + (pTP3Hit ? "  ✓" : ""), pTP3Hit ? cBull : cTxt)
+            r = f_row(dash, r, "Live R", na(liveR) ? "—" : str.tostring(liveR, "+0.00;-0.00") + "R", na(liveR) ? cMute : liveR >= 0 ? cBull : cBear)
+            r = f_row(dash, r, "Size · Risk", str.tostring(strategy.position_size, "#.####") + " · " + str.tostring(pRisk, "#,###"), cTxt)
+        r = f_row(dash, r, "Split", splitWarn ? "⚠ TP % must sum to 100" : (pDir != 0 and not pSplit ? "not splittable → full exit at " + fullExitAt : "3 legs"), splitWarn ? cBear : cMute)
+    if secPerf
+        r = f_head(dash, r, "PERFORMANCE")
+        r = f_row(dash, r, "Trades today", str.tostring(dayTrades) + " / " + str.tostring(maxPerDay), cTxt)
+        r = f_row(dash, r, "Win rate", na(winPct) ? "—" : str.tostring(winPct, "0.0") + "%  (" + str.tostring(nTr) + ")", cTxt)
+        r = f_row(dash, r, "Profit factor", na(profFac) ? "—" : str.tostring(profFac, "0.00"), cTxt)
+        r = f_row(dash, r, "Net profit", str.tostring(strategy.netprofit, "#,##0.00"), strategy.netprofit >= 0 ? cBull : cBear)
+        r = f_row(dash, r, "Max drawdown", str.tostring(strategy.max_drawdown, "#,##0.00"), cBear)
+        r = f_row(dash, r, "Average R", na(avgR) ? "—" : str.tostring(avgR, "+0.00;-0.00") + "R", cTxt)
+        r = f_row(dash, r, "Net R est. (costs)", na(costR) ? "—" : "−" + str.tostring(costR, "0.00") + "R / trade", cMute)
+        for i = 0 to 2
+            wp = sessCnt.get(i) > 0 ? str.tostring(sessWin.get(i) / sessCnt.get(i) * 100, "0") + "%" : "—"
+            r = f_row(dash, r, sessName.get(i) + " win %", wp + "  (" + str.tostring(sessCnt.get(i)) + ")", sessCol.get(i))
+        if nTr > 0 and strategy.wintrades + strategy.losstrades < nTr
+            r = f_row(dash, r, "Note", "some trades still open", cMute)
+    // Alert / event log (separate table)
+    if secLog and array.size(evLog) >= 0
+        lr = 0
+        table.cell(logT, 0, lr, "ALERT LOG", text_color=cTxt, text_size=size.small, bgcolor=color.new(cMute, 80))
+        lr += 1
+        for k = 0 to array.size(evLog) - 1
+            table.cell(logT, 0, lr, evLog.get(k), text_color=cTxt, text_size=size.tiny, bgcolor=k % 2 == 0 ? cRow : cPanel, text_halign=text.align_left)
+            lr += 1
+    // Legend (top-left, one short line per group)
+    if showLegend
+        table.cell(legend, 0, 0, "ORB · VWAP TREND SCALPER  [PRO]  ·  " + mkt, text_color=cTxt, text_size=size.small, text_halign=text.align_left)
+        table.cell(legend, 0, 1, "VWAP " + f_px(vwap) + "   ±1σ " + f_dist(vwapSd) + "   EMA" + str.tostring(emaLen) + " " + f_px(emaV), text_color=cVwap, text_size=size.tiny, text_halign=text.align_left)
+        table.cell(legend, 0, 2, "■ Asia  ■ London  ■ NY   |   ■ PD  ■ PW  ■ Opens", text_color=cMute, text_size=size.tiny, text_halign=text.align_left)
