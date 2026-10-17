@@ -621,8 +621,8 @@ if trigger
 
         // Trade visuals: entry, stop, targets and profit / risk zones
         if showTrades
-            lnE  := line.new(bar_index, entryPx, bar_index, entryPx, xloc=xloc.bar_index, color=color.white, width=1)
-            lnSL := line.new(bar_index, slPx, bar_index, slPx, xloc=xloc.bar_index, color=cBear, width=1)
+            lnE  := line.new(bar_index, entryPx, bar_index, entryPx, xloc=xloc.bar_index, color=color.white, width=2)
+            lnSL := line.new(bar_index, slPx, bar_index, slPx, xloc=xloc.bar_index, color=cBear, width=2)
             lnT1 := line.new(bar_index, tp1, bar_index, tp1, xloc=xloc.bar_index, color=color.new(cBull, 40), style=line.style_dashed, width=1)
             lnT2 := line.new(bar_index, tp2, bar_index, tp2, xloc=xloc.bar_index, color=color.new(cBull, 20), style=line.style_dashed, width=1)
             lnT3 := line.new(bar_index, tp3, bar_index, tp3, xloc=xloc.bar_index, color=cBull, style=line.style_dashed, width=1)
@@ -630,7 +630,7 @@ if trigger
                  bgcolor=color.new(cBull, 90), border_color=na)
             bxRisk := box.new(bar_index, math.max(entryPx, slPx), bar_index, math.min(entryPx, slPx), xloc=xloc.bar_index,
                  bgcolor=color.new(cBear, 90), border_color=na)
-            label.new(bar_index, isL ? low : high, isL ? "LONG" : "SHORT", xloc=xloc.bar_index,
+            label.new(bar_index, isL ? low : high, (isL ? "LONG " : "SHORT ") + f_px(entryPx) + "\nSL " + f_px(slPx), xloc=xloc.bar_index,
                  style=isL ? label.style_label_up : label.style_label_down,
                  color=isL ? cBull : cBear, textcolor=color.white, size=size.small,
                  tooltip="Session: " + sessName.get(candSess) + "\nEntry: " + f_px(entryPx) + "\nSL: " + f_px(slPx) +
@@ -732,7 +732,7 @@ if justClosed
               math.abs(exitPx - pTP2) <= tickSz * 2 ? "TP2 ✓" :
               math.abs(exitPx - pTP1) <= tickSz * 2 ? "TP1 ✓" : "EXIT"
     if showTrades
-        label.new(bar_index, exitPx, outcome + "  " + str.tostring(rTrade, "+0.00;-0.00") + "R", xloc=xloc.bar_index,
+        label.new(bar_index, exitPx, outcome + "  " + f_px(exitPx) + "  " + str.tostring(rTrade, "+0.00;-0.00") + "R", xloc=xloc.bar_index,
              style=isBE or isStop or forcedNow ? label.style_xcross : label.style_label_left,
              color=color.new(profit >= 0 ? cBull : cBear, 15), textcolor=color.white, size=size.tiny)
     f_log("CLOSED | " + outcome + " | " + str.tostring(rTrade, "+0.00;-0.00") + "R | " + exitId)
@@ -750,6 +750,27 @@ if justClosed
         lnT1 := na
         lnT2 := na
         lnT3 := na
+
+// ============================================================================
+// 8b. ACTIVE TRADE LEVEL LABELS (last bar only): price, distance in R, status
+// ============================================================================
+var array<label> tLbls = array.new<label>()
+if barstate.islast
+    for lbT in tLbls
+        label.delete(lbT)
+    tLbls.clear()
+    if showTrades and pDir != 0 and strategy.position_size != 0
+        lx = bar_index + 3
+        tLbls.push(label.new(lx, pEntry, "ENTRY  " + f_px(pEntry), xloc=xloc.bar_index, style=label.style_label_left,
+             color=color.new(color.white, 10), textcolor=color.black, size=size.small))
+        tLbls.push(label.new(lx, pSL, "SL  " + f_px(pSL) + (pBE ? "  (BE)" : "") + "  −1R", xloc=xloc.bar_index,
+             style=label.style_label_left, color=color.new(cBear, 0), textcolor=color.white, size=size.small))
+        tLbls.push(label.new(lx, pTP1, "TP1  " + f_px(pTP1) + "  +" + str.tostring(tp1R, "0.0") + "R · " + str.tostring(pct1, "0") + "%" + (pTP1Hit ? "  ✓" : ""),
+             xloc=xloc.bar_index, style=label.style_label_left, color=color.new(cBull, pTP1Hit ? 0 : 35), textcolor=color.white, size=size.small))
+        tLbls.push(label.new(lx, pTP2, "TP2  " + f_px(pTP2) + "  +" + str.tostring(tp2R, "0.0") + "R · " + str.tostring(pct2, "0") + "%" + (pTP2Hit ? "  ✓" : ""),
+             xloc=xloc.bar_index, style=label.style_label_left, color=color.new(cBull, pTP2Hit ? 0 : 35), textcolor=color.white, size=size.small))
+        tLbls.push(label.new(lx, pTP3, "TP3  " + f_px(pTP3) + "  +" + str.tostring(tp3R, "0.0") + "R · " + str.tostring(pct3, "0") + "%" + (pTP3Hit ? "  ✓" : ""),
+             xloc=xloc.bar_index, style=label.style_label_left, color=color.new(cBull, pTP3Hit ? 0 : 35), textcolor=color.white, size=size.small))
 
 // ============================================================================
 // 9. KEY LEVEL LABELS (last bar only, merged and nudged so they never overlap)
